@@ -18,7 +18,11 @@ relationship is tracked separately (it is not a DAG edge).
 
 import heapq
 
-from .errors import MissingDependencyError, ValidationError
+from .errors import (
+    MissingDependencyError,
+    PackageConflictError,
+    ValidationError,
+)
 from .model import validate_tx
 
 
@@ -85,6 +89,160 @@ def validate_incoming_batch(incoming, pool_map, loc="txs"):
     parents, _children = build_edges(combined)
     _check_acyclic(combined, parents, loc)
     return by_id
+
+
+def validate_package(incoming, pool_map, pool_outpoints, max_size, loc="package"):
+    """Validate one dependency package against the existing pool.
+
+    A package is up to ``max_size`` transactions submitted in arbitrary
+    order; it is accepted only when **all** of the following hold over
+    the union of pool and package transactions:
+
+    * every transaction passes field validation;
+    * package ids are unique and do not already exist in the pool;
+    * the package contains no intra-package double spend (one outpoint
+      spent by two package transactions);
+    * every parent reference -- an explicit ``depends`` id or a spent
+      ``"creator:vout"`` outpoint whose creator exists -- resolves to
+      either another package transaction or an existing pool tx
+      (missing parents are rejected);
+    * the package DAG is acyclic. A cycle can only exist entirely among
+      package nodes: pool transactions are immutable and never gain an
+      edge to a newly submitted tx, so every new edge either joins two
+      package nodes or points upward into the already-acyclic pool;
+    * no package transaction spends an outpoint already spent by a pool
+      transaction (packages never replace; such a spend is a
+      :class:`PackageConflictError`, not an eviction).
+
+    Returns ``(by_id, parents, children, order)`` for the package nodes
+    only: ``dict[txid -> Tx]``, edge sets restricted to package nodes
+    (edges to pool parents are retained in ``parents``), and the
+    lexicographically-smallest topological order of the package. Raises
+    a locatable error on the first failure; nothing is mutated.
+    """
+    if isinstance(incoming, (str, bytes)) or not hasattr(
+        incoming, "__iter__"
+    ):
+        raise ValidationError(
+            f"expected an iterable of Tx; got {type(incoming).__name__}",
+            loc,
+            kind="type_error",
+        )
+    incoming = list(incoming)
+    if not incoming:
+        raise ValidationError(
+            "package must contain at least one transaction",
+            loc,
+            kind="empty",
+        )
+    if len(incoming) > max_size:
+        raise ValidationError(
+            f"package size {len(incoming)} exceeds the maximum of "
+            f"{max_size} dependent transactions per submission",
+            loc,
+            kind="package_too_large",
+        )
+    by_id = {}
+    index_of = {}
+    # outpoint -> spending package txid, for intra-package double spend.
+    spenders = {}
+    for i, tx in enumerate(incoming):
+        iloc = f"{loc}[{i}]"
+        validate_tx(tx, iloc)
+        if tx.txid in pool_map or tx.txid in by_id:
+            raise ValidationError(
+                f"txid {tx.txid!r} already exists in the package/pool",
+                iloc,
+                kind="duplicate",
+            )
+        by_id[tx.txid] = tx
+        index_of[tx.txid] = i
+        for op in tx.inputs:
+            if op in spenders:
+                raise ValidationError(
+                    f"outpoint {op!r} spent by both {spenders[op]!r} and "
+                    f"{tx.txid!r} in the same package",
+                    f"{iloc}.inputs",
+                    kind="double_spend",
+                )
+            spenders[op] = tx.txid
+            if op in pool_outpoints:
+                raise PackageConflictError(
+                    tx.txid,
+                    op,
+                    pool_outpoints[op],
+                    loc=f"{iloc}.inputs",
+                )
+
+    combined = dict(pool_map)
+    combined.update(by_id)
+
+    # Resolve every parent reference: explicit depends and spent
+    # creator outpoints. Bare names / unknown creators are external
+    # coins and require nothing. (Spending one's own output is already
+    # rejected by validate_tx during the field pass above.)
+    def parents_of(tx):
+        ps = set(tx.depends)
+        for op in tx.inputs:
+            creator = outpoint_creator(op)
+            if creator is not None and creator != tx.txid and creator in combined:
+                ps.add(creator)
+        return ps
+
+    all_parents = {}
+    for txid, tx in by_id.items():
+        ps = parents_of(tx)
+        for dep in ps:
+            if dep not in combined:
+                raise MissingDependencyError(
+                    f"package transaction {txid!r} has a parent {dep!r} "
+                    f"that is neither in the package nor in the pool",
+                    missing=(dep,),
+                    loc=f"{loc}[{index_of[txid]}]",
+                )
+        all_parents[txid] = ps
+
+    # Build the package-restricted parent/children maps. Edges to pool
+    # parents are retained in ``parents`` (base nodes); children edges
+    # are only meaningful among package nodes.
+    pkg_ids = set(by_id)
+    parents = {tid: set(all_parents[tid]) for tid in by_id}
+    children = {tid: set() for tid in by_id}
+    for child, ps in parents.items():
+        for p in ps:
+            if p in pkg_ids:
+                children[p].add(child)
+
+    # Kahn over the package nodes; indegree counts only
+    # package-internal edges because edges to pool parents leave the
+    # package and pool nodes never point back at package nodes.
+    indeg = {tid: 0 for tid in pkg_ids}
+    local_children = {tid: set() for tid in pkg_ids}
+    for tid in pkg_ids:
+        for p in parents[tid]:
+            if p in pkg_ids:
+                indeg[tid] += 1
+                local_children[p].add(tid)
+    heap = [tid for tid, d in indeg.items() if d == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        node = heapq.heappop(heap)
+        order.append(node)
+        for ch in local_children[node]:
+            indeg[ch] -= 1
+            if indeg[ch] == 0:
+                heapq.heappush(heap, ch)
+    if len(order) != len(pkg_ids):
+        cyclic = sorted(tid for tid, d in indeg.items() if d > 0)
+        raise ValidationError(
+            f"dependency cycle detected within the package involving "
+            f"{cyclic}",
+            loc,
+            kind="cycle",
+        )
+
+    return by_id, parents, children, order
 
 
 def validate_batch(txs, loc="txs"):

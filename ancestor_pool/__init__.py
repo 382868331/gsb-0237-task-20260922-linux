@@ -2,10 +2,11 @@
 
 Public surface:
     Tx, make_tx
-    AncestorPool, AddResult
+    AncestorPool, AddResult, PackageResult, MAX_PACKAGE_SIZE
     select_package, SelectionResult, Exclusion
     MempoolError, ValidationError, DuplicateTxIdError,
-    MissingDependencyError, ReplacementRejectedError
+    MissingDependencyError, ReplacementRejectedError,
+    PackageConflictError
 
 Only the small mathematical subset defined by this task is implemented;
 it is not intended to be wire-compatible with any full node mempool.
@@ -17,13 +18,14 @@ from .errors import (
     DuplicateTxIdError,
     MissingDependencyError,
     ReplacementRejectedError,
+    PackageConflictError,
     REASON_FEE_NOT_GREATER,
     REASON_FEE_RATE_NOT_HIGHER,
     REASON_DEPENDS_ON_REMOVED,
 )
 from .model import Tx, make_tx, validate_tx
-from .graph import validate_batch
-from .pool import AncestorPool, AddResult
+from .graph import validate_batch, validate_package
+from .pool import AncestorPool, AddResult, PackageResult, MAX_PACKAGE_SIZE
 from .select import (
     select_package,
     SelectionResult,
@@ -43,8 +45,11 @@ __all__ = [
     "make_tx",
     "validate_tx",
     "validate_batch",
+    "validate_package",
     "AncestorPool",
     "AddResult",
+    "PackageResult",
+    "MAX_PACKAGE_SIZE",
     "select_package",
     "SelectionResult",
     "Exclusion",
@@ -53,6 +58,7 @@ __all__ = [
     "DuplicateTxIdError",
     "MissingDependencyError",
     "ReplacementRejectedError",
+    "PackageConflictError",
     "REASON_FEE_NOT_GREATER",
     "REASON_FEE_RATE_NOT_HIGHER",
     "REASON_DEPENDS_ON_REMOVED",

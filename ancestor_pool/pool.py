@@ -37,10 +37,14 @@ from .graph import (
     closure_maps,
     outpoint_creator,
     validate_incoming_batch,
+    validate_package,
 )
 from .model import validate_tx
 
 REASON_REPLACEMENT_DISALLOWED = "replacement_disallowed"
+
+#: Maximum number of transactions accepted in one submit_package call.
+MAX_PACKAGE_SIZE = 8
 
 
 class AddResult:
@@ -72,6 +76,35 @@ class AddResult:
         return (
             f"AddResult(txid={self.txid!r}, replaced={self.replaced}, "
             f"removed_ids={sorted(self.removed_ids)!r})"
+        )
+
+
+class PackageResult:
+    """Outcome of a successful :meth:`AncestorPool.submit_package`.
+
+    Attributes:
+        txids: tuple of the newly accepted package ids.
+        order: tuple of ids in the lexicographically-smallest
+            topological (parent-first) order of the package itself.
+        attached: frozenset of already-in-pool txids that are direct
+            parents of at least one package tx (the pre-existing
+            ancestors the package attaches to).
+        total_fee / total_weight: aggregate over the package txs.
+    """
+
+    __slots__ = ("txids", "order", "attached", "total_fee", "total_weight")
+
+    def __init__(self, txids, order, attached, total_fee, total_weight):
+        self.txids = tuple(txids)
+        self.order = tuple(order)
+        self.attached = frozenset(attached)
+        self.total_fee = total_fee
+        self.total_weight = total_weight
+
+    def __repr__(self):
+        return (
+            f"PackageResult(order={list(self.order)!r}, "
+            f"attached={sorted(self.attached)!r})"
         )
 
 
@@ -337,3 +370,71 @@ class AncestorPool:
             results.append(scratch._add(tx, allow_replacement=True))
         self._adopt(scratch)
         return tuple(results)
+
+    # --- package submission ---------------------------------------------
+
+    def submit_package(self, txs):
+        """Atomically submit one dependency package of up to 8 txs.
+
+        The transactions may be given in **any order**; they are treated
+        as a single DAG and validated together. The whole package is
+        committed only if every check passes; a failure leaves the pool
+        byte-for-byte unchanged (no half package).
+
+        Checks (all-or-nothing):
+          * field validity of every transaction;
+          * at most :data:`MAX_PACKAGE_SIZE` (8) transactions, non-empty;
+          * unique ids, none already present in the pool;
+          * no cycle inside the package;
+          * no intra-package double spend (two txs spending one outpoint);
+          * every parent -- an explicit ``depends`` or a spent
+            ``"creator:vout"`` outpoint -- is either another package tx
+            or an *existing* pool ancestor (missing parent rejected);
+          * no package tx spends an outpoint already spent in the pool
+            (package submission never replaces/evicts; raises
+            :class:`PackageConflictError`; use :meth:`add` for the
+            fee-gated single-tx replacement path);
+          * the pool's 30-tx capacity is not exceeded (packages never
+            evict, so this is plain growth).
+
+        Returns:
+            PackageResult.
+        """
+        # All validation happens before any mutation, so the "no half
+        # package" guarantee needs no rollback path.
+        by_id, parents, _children, order = validate_package(
+            txs, self._txs, self._outpoint_owner, MAX_PACKAGE_SIZE
+        )
+
+        if len(self._txs) + len(by_id) > self.MAX_TRANSACTIONS:
+            raise ValidationError(
+                f"accepting {len(by_id)} package txs would exceed pool "
+                f"capacity {self.MAX_TRANSACTIONS} "
+                f"(currently {len(self._txs)}); package submission never "
+                f"evicts existing transactions",
+                loc="pool",
+                kind="capacity",
+            )
+
+        # Keep the caller's submission order for the reported id list.
+        submitted = tuple(by_id)
+
+        # Commit: install the txs, register outpoints, rebuild edges and
+        # closures in one step. validate_package already proved that no
+        # registered outpoint collides and every parent resolves.
+        self._txs.update(by_id)
+        for pkg_tx in by_id.values():
+            for op in pkg_tx.inputs:
+                self._outpoint_owner[op] = pkg_tx.txid
+        self._parents, self._children = build_edges(self._txs)
+        self._refresh_closures()
+
+        pkg_ids = set(by_id)
+        attached = set()
+        for pkg_id in pkg_ids:
+            attached.update(self._parents[pkg_id] - pkg_ids)
+        total_fee = sum(tx.fee for tx in by_id.values())
+        total_weight = sum(tx.weight for tx in by_id.values())
+        return PackageResult(
+            submitted, order, attached, total_fee, total_weight
+        )

@@ -68,3 +68,34 @@ class ReplacementRejectedError(MempoolError):
         super().__init__(
             f"replacement by {incoming_id!r} rejected ({reason}): {detail}"
         )
+
+
+class PackageConflictError(MempoolError):
+    """Raised when a submitted package spends a pool-owned outpoint.
+
+    Package submission (:meth:`AncestorPool.submit_package`) never
+    evicts existing transactions (it is not a replacement path); a
+    package transaction spending an outpoint already spent in the pool
+    is therefore rejected and the whole package is refused atomically.
+    Use the single-tx :meth:`AncestorPool.add` interface for a
+    fee-gated replacement.
+
+    Attributes:
+        txid: package transaction attempting the conflicting spend.
+        outpoint: the contested outpoint string.
+        owner: txid of the pool transaction currently spending it.
+        loc: locatable path, e.g. ``"package[2].inputs"``.
+    """
+
+    def __init__(self, txid, outpoint, owner, loc="?"):
+        self.txid = txid
+        self.outpoint = outpoint
+        self.owner = owner
+        self.loc = loc
+        prefix = f"[{loc}] " if loc not in (None, "?") else ""
+        super().__init__(
+            f"{prefix}package transaction {txid!r} spends outpoint "
+            f"{outpoint!r} already spent by pool transaction {owner!r}; "
+            f"package submission never replaces (use add() for a "
+            f"fee-gated replacement)"
+        )

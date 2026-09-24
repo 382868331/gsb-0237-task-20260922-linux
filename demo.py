@@ -11,16 +11,22 @@ prints:
 2. an actually-triggered rejection boundary -- a replacement whose fee
    rate is not strictly higher is refused atomically;
 3. the search-budget boundary -- a tiny node budget returns
-   ``budget_exhausted`` instead of an optimality claim.
+   ``budget_exhausted`` instead of an optimality claim;
+4. atomic dependency-package submission -- an 8-tx package submitted
+   out of order, the 8-tx size boundary, and a real failure (a package
+   double-spend / pool conflict) that leaves no half package.
 """
 
 import time
 
 from ancestor_pool import (
     AncestorPool,
+    MAX_PACKAGE_SIZE,
+    PackageConflictError,
     make_tx,
     select_package,
     ReplacementRejectedError,
+    ValidationError,
     STATUS_BUDGET_EXHAUSTED,
 )
 
@@ -87,6 +93,65 @@ def main():
     print(f"best package found: {list(bounded.selected)} "
           f"fee={bounded.total_fee} -- returned without optimality claim")
     assert bounded.status == STATUS_BUDGET_EXHAUSTED
+
+    # ---- Atomic dependency-package submission ---------------------------
+    hr("[5] Normal package: 8 dependent txs submitted out of order")
+    # A fresh pool with one pre-existing ancestor.
+    ppool = AncestorPool()
+    ppool.add(make_tx("b0", 4, 3, inputs=("basecoin:0",)))
+    # DAG (package nodes): a -> c,d ; {c,d} -> e ; e -> f,g ;
+    # x and y are independent external-coin txs in the same package.
+    # Hand-derived lex-smallest topological order:
+    #   a, c, d, e, f, g, x, y
+    package = [
+        make_tx("f", 2, 4, inputs=("e:0",)),
+        make_tx("y", 2, 1, inputs=("ex2:0",)),
+        make_tx("a", 2, 5, inputs=("b0:0",)),
+        make_tx("g", 2, 2, inputs=("e:1",)),
+        make_tx("d", 2, 3, inputs=("a:1",)),
+        make_tx("x", 2, 6, inputs=("ex1:0",)),
+        make_tx("c", 2, 7, inputs=("a:0",)),
+        make_tx("e", 2, 8, inputs=("c:0", "d:0",)),
+    ]
+    pres = ppool.submit_package(package)
+    print("submission order (scrambled):", [t.txid for t in package])
+    print("topological order committed  :", list(pres.order))
+    print("attaches to existing ancestor:", sorted(pres.attached))
+    print(f"package totals: fee={pres.total_fee} weight="
+          f"{pres.total_weight}; pool size now {len(ppool)}")
+    print("parents(e) =", sorted(ppool.parents("e")),
+          " ancestors(f) =", sorted(ppool.ancestors("f")))
+
+    hr("[6] Package size boundary: 9 txs refused, pool untouched")
+    boundary_pool = AncestorPool()
+    nine = [make_tx(f"n{i}", 1, 1, inputs=(f"nc{i}:0",)) for i in range(9)]
+    try:
+        boundary_pool.submit_package(nine)
+    except ValidationError as err:
+        print(f"ValidationError kind={err.kind!r}: {err}")
+    print(f"limit is MAX_PACKAGE_SIZE={MAX_PACKAGE_SIZE}; pool size "
+          f"after refusal: {len(boundary_pool)}")
+
+    hr("[7] Package failure is atomic: pool-owned outpoint conflict")
+    cpool = AncestorPool()
+    cpool.add(make_tx("old", 10, 5, inputs=("owned:0",)))
+    before = sorted(cpool.ids())
+    # Even a vastly over-paying tx cannot evict via package submission.
+    try:
+        cpool.submit_package([
+            make_tx("new", 1, 1_000_000, inputs=("owned:0",)),
+            make_tx("tail", 1, 1, inputs=("new:0",)),
+        ])
+    except PackageConflictError as err:
+        print(f"PackageConflictError: {err.txid!r} spends {err.outpoint!r} "
+              f"owned by {err.owner!r}")
+        print("  (package submission never replaces; use add())")
+    print(f"pool unchanged after refusal: {sorted(cpool.ids()) == before} "
+          f"{sorted(cpool.ids())}")
+    # The legacy single-tx interface still does the fee-gated replacement.
+    rres = cpool.add(make_tx("new", 1, 6, inputs=("owned:0",)))
+    print(f"legacy add() still replaces: evicted={sorted(rres.removed_ids)} "
+          f"pool={sorted(cpool.ids())}")
 
     elapsed = time.perf_counter() - t0
     print()

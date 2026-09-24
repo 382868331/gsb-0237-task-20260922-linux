@@ -8,8 +8,9 @@ transaction DAG.
 - Python: **3.14.7** (standard library only; no third-party packages)
 - OS: Linux native; no network, accounts, keys, database, middleware,
   cloud API, or Docker
-- Interface bound: at most **30 transactions** in a pool; the
-  independent exhaustive reference supports **≤ 16 transactions**
+- Interface bound: at most **30 transactions** in a pool; one
+  `submit_package` call carries at most **8 dependent transactions**;
+  the independent exhaustive reference supports **≤ 16 transactions**
 
 This implements only the finite mathematical/protocol subset defined by
 this task. It is **not** a full node mempool and makes no claim of
@@ -21,14 +22,16 @@ Bitcoin/BIP125 or any other industry-standard wire compatibility.
 ancestor_pool/          importable library
   errors.py             error hierarchy + stable reason codes
   model.py              Tx / make_tx + field validation
-  graph.py              DAG edges, closures, cycles, topological order
+  graph.py              DAG edges, closures, cycles, topological order,
+                        package validation (validate_package)
   pool.py               AncestorPool: atomic add / replacement / batch
+                        / submit_package (<=8-tx dependency package)
   select.py             select_package: budgeted branch-and-bound
 tests/
   _reference.py         independent <=16-tx exhaustive reference
                         (does NOT import or call the core solver)
   _data.py              deterministic seeded synthetic DAG generator
-  test_*.py             unit + cross-check tests
+  test_*.py             unit + cross-check tests (incl. test_package)
 demo.py                 fixed-input live demonstration
 ```
 
@@ -77,7 +80,8 @@ and Infinity cannot enter the system.
 All derive from `MempoolError`:
 
 - `ValidationError(message, loc, kind)` — invalid field; `loc` pinpoints
-  it (e.g. `"txs[3].fee"`); input is never silently corrected.
+  it (e.g. `"txs[3].fee"` or `"package[2].inputs"`); input is never
+  silently corrected.
 - `DuplicateTxIdError`, `MissingDependencyError(missing=...)`
 - `ReplacementRejectedError(incoming_id, removed_ids, reason, detail)`
   with stable `reason` codes:
@@ -85,6 +89,55 @@ All derive from `MempoolError`:
   - `fee_rate_not_strictly_higher`
   - `depends_on_removed_set`
   - `replacement_disallowed` (when `allow_replacement=False`)
+- `PackageConflictError(txid, outpoint, owner, loc)` — a package tx
+  tried to spend an outpoint already spent in the pool; package
+  submission never evicts, so this is a refusal, not a replacement.
+
+## Package submission — `AncestorPool.submit_package(txs)`
+
+Accepts **one package of at most 8 dependent transactions** (constant
+`MAX_PACKAGE_SIZE = 8`) given in **any order**. The package is treated
+as a single DAG and validated as a whole before anything is committed;
+the package enters the pool only when **every** check passes, otherwise
+the pool is left byte-for-byte unchanged (no half package).
+
+Checks performed together:
+
+1. every transaction passes field validation (loc reported with its
+   package index, e.g. `package[3].weight`);
+2. the package is non-empty and has at most 8 txs
+   (`kind="empty"` / `kind="package_too_large"`);
+3. ids are unique within the package and absent from the pool
+   (`kind="duplicate"`);
+4. the package DAG has **no cycle** (`kind="cycle"`);
+5. **no intra-package double spend** — two package txs spending one
+   outpoint (`kind="double_spend"`);
+6. every parent — an explicit `depends` id or a spent
+   `"creator:vout"` outpoint — is either another package tx or an
+   **existing pool ancestor**; an unresolvable parent raises
+   `MissingDependencyError`. An outpoint whose creator matches no
+   package/pool tx is still an external coin and needs no parent;
+7. no package tx spends an outpoint already spent by a pool tx — that
+   raises `PackageConflictError` (package submission **never**
+   replaces/evicts; use the single-tx `add` for a fee-gated
+   replacement, even with a high fee);
+8. the 30-tx pool capacity would not be exceeded (`kind="capacity"`;
+   packages only grow the pool, never evict).
+
+On success it returns `PackageResult`:
+
+- `order` — package ids in the lexicographically-smallest topological
+  (parent-first) order;
+- `txids` — the accepted ids in submission order;
+- `attached` — already-in-pool txids that are direct parents of a
+  package tx (the pre-existing ancestors it attaches to);
+- `total_fee` / `total_weight` — aggregate over the package txs.
+
+After commit the package txs are ordinary pool transactions with the
+same read-only views (`parents`, `ancestors`, `spender_of`, …) and are
+selectable by `select_package`. The legacy interfaces are unchanged:
+`add(tx)` still does single-tx atomic fee-gated replacement, and
+`add_many(txs)` still applies an iterable in order on a scratch copy.
 
 ## Replacement semantics — `AncestorPool.add(tx)`
 
@@ -172,6 +225,11 @@ human-readable rates.
 - Removed set includes **all** descendants of any direct conflict
   (orphan eviction), even when a descendant is individually high fee;
   this matches the stated rule and is covered by a test.
+- Package submission is deliberately **non-replacing**: a package tx
+  spending a pool-owned outpoint is refused (`PackageConflictError`)
+  rather than evicting; the single-tx fee-gated `add` remains the only
+  replacement path. This keeps "all 8 validate together, then enter" a
+  pure append with an unambiguous all-or-nothing result.
 - External coins are syntactic (`"creator:vout"` with no matching
   creator) rather than modelled as UTXOs, sufficient for the synthetic
   DAG contract.
@@ -187,6 +245,10 @@ human-readable rates.
 - No signatures, scripts, consensus rules, timelocks, mempool policy
   knobs (signaling, BIP125 rules, package limits beyond count), or
   persistence; in-memory single-process only.
+- `submit_package` is append-only (no replacement and no cross-package
+  fee/fee-rate rule); fee-gated eviction stays on single-tx `add`.
+  Package relaying/rebroadcast and chained-package ordering policy are
+  out of scope for this iteration.
 - Tie-break is exactly one documented convention (ascending-id tuple,
   prefix-smallest); other lexicographic conventions are not offered.
 
@@ -197,4 +259,6 @@ successful conflict replacement that evicts a low-fee parent and its
 high-fee child, the proven fee-optimal package with three different
 per-exclusion reasons, an actually raised
 `ReplacementRejectedError(fee_rate_not_strictly_higher)` boundary with
-the pool verified unchanged, and a real `budget_exhausted` result.
+the pool verified unchanged, a real `budget_exhausted` result, and the
+dependency-package path: an 8-tx package committed out of order, the
+9-tx size-limit refusal, and an atomic `PackageConflictError` refusal.
