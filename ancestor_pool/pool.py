@@ -36,11 +36,14 @@ from .graph import (
     build_edges,
     closure_maps,
     outpoint_creator,
+    topo_order,
     validate_incoming_batch,
+    validate_package_submission,
 )
 from .model import validate_tx
 
 REASON_REPLACEMENT_DISALLOWED = "replacement_disallowed"
+MAX_PACKAGE_SIZE = 8
 
 
 class AddResult:
@@ -73,6 +76,32 @@ class AddResult:
             f"AddResult(txid={self.txid!r}, replaced={self.replaced}, "
             f"removed_ids={sorted(self.removed_ids)!r})"
         )
+
+
+class PackageResult:
+    """Outcome of a successful :meth:`AncestorPool.add_package`.
+
+    Attributes:
+        ids: frozenset of every transaction id accepted in the package.
+        order: the package's own txs in the lexicographically-smallest
+            topological order (parents inside the package first; pool
+            parents are already in the pool and need no position).
+        added_fee / added_weight: aggregate totals of the package only.
+    """
+
+    __slots__ = ("ids", "order", "added_fee", "added_weight")
+
+    def __init__(self, ids, order, added_fee, added_weight):
+        self.ids = frozenset(ids)
+        self.order = tuple(order)
+        self.added_fee = added_fee
+        self.added_weight = added_weight
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __repr__(self):
+        return f"PackageResult(order={list(self.order)!r})"
 
 
 class AncestorPool:
@@ -337,3 +366,81 @@ class AncestorPool:
             results.append(scratch._add(tx, allow_replacement=True))
         self._adopt(scratch)
         return tuple(results)
+
+    def add_package(self, txs, *, max_size=MAX_PACKAGE_SIZE):
+        """Atomically accept one ancestor package (1..``max_size`` txs).
+
+        The transactions are treated as a single dependency package:
+        their given order is irrelevant (parents may occur at any
+        position), the whole package is validated as a DAG together with
+        the existing pool, and it enters the pool only when *every*
+        check passes. Failure leaves no half package behind.
+
+        Package submission is append-only: a tx spending an outpoint
+        already spent in the pool is rejected
+        (``ValidationError(kind="conflict_with_pool")``) rather than
+        triggering replacement. Use :meth:`add` for conflict
+        replacement.
+
+        Validation (all before any mutation): field errors with
+        ``loc="txs[i]...."``, duplicate ids inside the package or
+        versus the pool, intra-package double spends, spends of
+        pool-owned outpoints, parents absent from pool and package
+        (:class:`MissingDependencyError`), cycles over pool ∪ package,
+        and the pool's 30-tx capacity.
+
+        Returns:
+            PackageResult.
+        """
+        if isinstance(txs, (str, bytes)) or not hasattr(txs, "__iter__"):
+            raise ValidationError(
+                f"expected an iterable of Tx; got {type(txs).__name__}",
+                "txs",
+                kind="type_error",
+            )
+        if isinstance(max_size, bool) or not isinstance(max_size, int):
+            raise ValidationError(
+                f"max_size must be an int (bool rejected); got "
+                f"{type(max_size).__name__}",
+                "max_size",
+                kind="type_error",
+            )
+        if not 1 <= max_size <= MAX_PACKAGE_SIZE:
+            raise ValidationError(
+                f"max_size must be within 1..{MAX_PACKAGE_SIZE}; got "
+                f"{max_size}",
+                "max_size",
+                kind="out_of_range",
+            )
+        txs = list(txs)
+
+        # Whole-package validation runs before the scratch commit, so
+        # every rejection leaves the live pool byte-for-byte unchanged.
+        validate_package_submission(
+            txs,
+            self._txs,
+            self._outpoint_owner,
+            max_size=max_size,
+            pool_capacity=self.MAX_TRANSACTIONS,
+            loc="txs",
+        )
+
+        package_ids = {tx.txid for tx in txs}
+        scratch = self._clone()
+        for tx in txs:
+            scratch._txs[tx.txid] = tx
+            for op in tx.inputs:
+                # Validated above: the outpoint is owned neither by the
+                # pool nor by another package transaction.
+                scratch._outpoint_owner[op] = tx.txid
+        # Rebuild edges over pool ∪ package at once: this is what makes
+        # acceptance order-independent (no sequential parent resolution).
+        scratch._parents, scratch._children = build_edges(scratch._txs)
+        scratch._refresh_closures()
+        order = topo_order(
+            scratch._txs, scratch._parents, subset=package_ids
+        )
+        added_fee = sum(tx.fee for tx in txs)
+        added_weight = sum(tx.weight for tx in txs)
+        self._adopt(scratch)
+        return PackageResult(package_ids, order, added_fee, added_weight)

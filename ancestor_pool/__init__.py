@@ -2,7 +2,7 @@
 
 Public surface:
     Tx, make_tx
-    AncestorPool, AddResult
+    AncestorPool, AddResult, PackageResult, MAX_PACKAGE_SIZE
     select_package, SelectionResult, Exclusion
     MempoolError, ValidationError, DuplicateTxIdError,
     MissingDependencyError, ReplacementRejectedError
@@ -22,8 +22,8 @@ from .errors import (
     REASON_DEPENDS_ON_REMOVED,
 )
 from .model import Tx, make_tx, validate_tx
-from .graph import validate_batch
-from .pool import AncestorPool, AddResult
+from .graph import validate_batch, validate_package_submission
+from .pool import AncestorPool, AddResult, PackageResult, MAX_PACKAGE_SIZE
 from .select import (
     select_package,
     SelectionResult,
@@ -43,8 +43,11 @@ __all__ = [
     "make_tx",
     "validate_tx",
     "validate_batch",
+    "validate_package_submission",
     "AncestorPool",
     "AddResult",
+    "PackageResult",
+    "MAX_PACKAGE_SIZE",
     "select_package",
     "SelectionResult",
     "Exclusion",

@@ -21,8 +21,9 @@ Bitcoin/BIP125 or any other industry-standard wire compatibility.
 ancestor_pool/          importable library
   errors.py             error hierarchy + stable reason codes
   model.py              Tx / make_tx + field validation
-  graph.py              DAG edges, closures, cycles, topological order
-  pool.py               AncestorPool: atomic add / replacement / batch
+  graph.py              DAG edges, closures, cycles, topological order,
+                        batch and package structural validation
+  pool.py               AncestorPool: atomic add / add_many / add_package
   select.py             select_package: budgeted branch-and-bound
 tests/
   _reference.py         independent <=16-tx exhaustive reference
@@ -113,6 +114,49 @@ Read-only helpers: `len`, `in`, `ids()`, `get()`, `parents()`,
 Capacity is 30 txs; a conflicting add at capacity is a replacement
 (removes ≥ 1), not growth.
 
+## Ancestor-package submission — `AncestorPool.add_package(txs, *, max_size=8)`
+
+Submits **one dependency package of 1–8 transactions atomically**: the
+given order is irrelevant (a parent may sit at any position, including
+after its children — edges are resolved over pool ∪ package in one
+pass), the whole package is validated as a DAG together, and it enters
+the pool only when **every** check passes. On any failure nothing from
+the package is kept: the live pool's txs, edges, closures and outpoint
+ownership are byte-for-byte unchanged (all checks run before the
+scratch copy is adopted).
+
+Checks, each with a locatable `ValidationError`/`MissingDependencyError`:
+
+- size must be within `1..max_size` (`kind="empty_package"` /
+  `"package_too_large"`); `max_size` is keyword-only, an `int` in
+  `1..8` (`MAX_PACKAGE_SIZE`);
+- accepting the package must keep the pool ≤ 30 (`kind="capacity"`);
+- per-field validity with indexed locations `txs[i].field`;
+- duplicate ids inside the package or against the pool
+  (`kind="duplicate"`);
+- the same outpoint spent by two package txs (`kind="double_spend"`);
+- spending an outpoint already spent **in the pool** — package
+  submission is **append-only and never replaces**: this raises
+  `kind="conflict_with_pool"`. Conflict replacement still goes through
+  the single-tx `add` (with its fee/fee-rate rules);
+- an explicit `depends` parent missing from both pool and package
+  raises `MissingDependencyError(missing=(...))` with loc
+  `txs[i].depends[j]`. Spending an outpoint whose creator prefix
+  matches no known tx remains an external coin and needs no parent;
+- any dependency cycle over pool ∪ package (`kind="cycle"`), including
+  cycles formed purely through spent creator outpoints.
+
+Returns `PackageResult`:
+
+- `order` — the package txs in the lexicographically-smallest
+  topological order (parents within the package first; pool parents
+  need no position because they are already stored);
+- `ids` (frozenset), `added_fee`, `added_weight`, `len(result)`.
+
+`add` and `add_many` are unchanged and remain available; a later
+package can build on an earlier one or on pool transactions. An
+iterable (e.g. a generator) is accepted; a bare `str` is rejected.
+
 ## Package selection — `select_package(pool, block_weight, *, node_budget)`
 
 Finds the dependency-closed (ancestor-closed) subset maximising total
@@ -189,6 +233,11 @@ human-readable rates.
   persistence; in-memory single-process only.
 - Tie-break is exactly one documented convention (ascending-id tuple,
   prefix-smallest); other lexicographic conventions are not offered.
+- Package submission is append-only: a package that conflicts with an
+  already-pooled outpoint is rejected rather than applying RBF as a
+  batch; package-level replacement with aggregate fee/fee-rate policy,
+  chain-reorg re-feed, and memory eviction are intentionally out of
+  scope for this iteration (single-tx replacement remains available).
 
 ## Demo
 
@@ -197,4 +246,8 @@ successful conflict replacement that evicts a low-fee parent and its
 high-fee child, the proven fee-optimal package with three different
 per-exclusion reasons, an actually raised
 `ReplacementRejectedError(fee_rate_not_strictly_higher)` boundary with
-the pool verified unchanged, and a real `budget_exhausted` result.
+the pool verified unchanged, a real `budget_exhausted` result, and the
+atomic ancestor package: an unordered 8-tx DAG (the inclusive size
+boundary) accepted in topological order, plus actually triggered
+cycle / intra-package double-spend / pool-owned-outpoint /
+missing-parent errors each verified to leave the pool unchanged.

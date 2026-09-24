@@ -87,6 +87,121 @@ def validate_incoming_batch(incoming, pool_map, loc="txs"):
     return by_id
 
 
+def validate_package_submission(
+    incoming,
+    pool_map,
+    pool_outpoints,
+    *,
+    max_size,
+    pool_capacity,
+    loc="txs",
+):
+    """Validate one ancestor-package submission against the existing pool.
+
+    Package semantics differ from sequential :meth:`add` calls:
+
+    * the package contains ``1..max_size`` transactions and the resulting
+      pool must stay within ``pool_capacity``;
+    * incoming order is irrelevant -- a parent may appear at any position
+      because edges are resolved over the union pool ∪ package;
+    * submission is append-only: spending an outpoint already spent in
+      the pool is rejected (``conflict_with_pool``), never treated as a
+      replacement;
+    * every check below runs before any state change.
+
+    Checks, in order: field validity (``loc=txs[i].field``), duplicate
+    ids inside the package or against the pool (``duplicate``),
+    intra-package double spend (``double_spend``), spends of
+    pool-owned outpoints (``conflict_with_pool``), explicit parents
+    absent from both pool and package (:class:`MissingDependencyError`),
+    and dependency cycles over the union (``cycle``). Outpoints whose
+    creator prefix matches no known id remain external coins.
+
+    Returns ``dict[txid -> Tx]`` for the package transactions.
+    """
+    n = len(incoming)
+    if n == 0:
+        raise ValidationError(
+            "package must contain at least 1 transaction",
+            loc,
+            kind="empty_package",
+        )
+    if n > max_size:
+        raise ValidationError(
+            f"package size {n} exceeds the maximum of {max_size} "
+            f"transactions",
+            loc,
+            kind="package_too_large",
+        )
+    if len(pool_map) + n > pool_capacity:
+        raise ValidationError(
+            f"accepting {n} transactions would exceed pool capacity "
+            f"{pool_capacity} (pool currently holds {len(pool_map)})",
+            loc,
+            kind="capacity",
+        )
+
+    by_id = {}
+    # Seed with pool ownership so spends of pool outpoints are detected;
+    # ownership also tells whether a clash is intra-package or vs pool.
+    owners = dict(pool_outpoints)
+    for i, tx in enumerate(incoming):
+        iloc = f"{loc}[{i}]"
+        validate_tx(tx, iloc)
+        if tx.txid in pool_map:
+            raise ValidationError(
+                f"txid {tx.txid!r} already exists in the pool",
+                f"{iloc}.txid",
+                kind="duplicate",
+            )
+        if tx.txid in by_id:
+            raise ValidationError(
+                f"duplicate txid {tx.txid!r} within package",
+                f"{iloc}.txid",
+                kind="duplicate",
+            )
+        by_id[tx.txid] = tx
+        for j, op in enumerate(tx.inputs):
+            oloc = f"{iloc}.inputs[{j}]"
+            if op in owners:
+                owner = owners[op]
+                if owner in pool_map:
+                    raise ValidationError(
+                        f"outpoint {op!r} is already spent in the pool by "
+                        f"{owner!r}; package submission is append-only and "
+                        f"never replaces existing transactions (use "
+                        f"AncestorPool.add for a replacement)",
+                        oloc,
+                        kind="conflict_with_pool",
+                    )
+                raise ValidationError(
+                    f"outpoint {op!r} spent by both {owner!r} and "
+                    f"{tx.txid!r} within the package",
+                    oloc,
+                    kind="double_spend",
+                )
+            owners[op] = tx.txid
+
+    combined = dict(pool_map)
+    combined.update(by_id)
+    # Explicit parents must be provided either by the pool (an existing
+    # ancestor) or by another package tx at any position. Creator-less
+    # outpoints are external coins and need no parent (same rule as
+    # everywhere else); self-spend is already rejected by validate_tx.
+    for i, tx in enumerate(incoming):
+        for j, dep in enumerate(tx.depends):
+            if dep not in combined:
+                raise MissingDependencyError(
+                    f"transaction {tx.txid!r} depends on parent {dep!r} "
+                    f"that is absent from both the package and the pool",
+                    missing=(dep,),
+                    loc=f"{loc}[{i}].depends[{j}]",
+                )
+    parents, _children = build_edges(combined)
+    _check_acyclic(combined, parents, loc)
+    return by_id
+
+
 def validate_batch(txs, loc="txs"):
     """Validate an iterable of :class:`Tx` as a self-consistent batch.
 

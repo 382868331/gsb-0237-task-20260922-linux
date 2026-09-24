@@ -11,7 +11,12 @@ prints:
 2. an actually-triggered rejection boundary -- a replacement whose fee
    rate is not strictly higher is refused atomically;
 3. the search-budget boundary -- a tiny node budget returns
-   ``budget_exhausted`` instead of an optimality claim.
+   ``budget_exhausted`` instead of an optimality claim;
+4. the atomic ancestor package -- an unordered 8-tx DAG submitted at
+   once (the inclusive size boundary), accepted in topological order,
+   followed by actually-triggered package validation errors (cycle,
+   intra-package double spend, spend of a pool-owned outpoint, missing
+   parent), each leaving the pool byte-for-byte unchanged.
 """
 
 import time
@@ -21,6 +26,8 @@ from ancestor_pool import (
     make_tx,
     select_package,
     ReplacementRejectedError,
+    MissingDependencyError,
+    ValidationError,
     STATUS_BUDGET_EXHAUSTED,
 )
 
@@ -87,6 +94,85 @@ def main():
     print(f"best package found: {list(bounded.selected)} "
           f"fee={bounded.total_fee} -- returned without optimality claim")
     assert bounded.status == STATUS_BUDGET_EXHAUSTED
+
+    hr("[5] Atomic ancestor package (at most 8 txs, order irrelevant)")
+    pp = AncestorPool()
+    pp.add(make_tx("base", weight=2, fee=1, inputs=("basecoin:0",)))
+    # 8-tx DAG handed in deliberately non-topological order:
+    # a -> b,c ; {b,c} -> d ; base(in pool) -> e -> f ; {d,f} -> g ;
+    # h is independent. g is submitted first though it depends on d, f.
+    package = [
+        make_tx("g", 2, 2, inputs=("d:0", "f:0")),
+        make_tx("h", 2, 2, inputs=("coin-h:0",)),
+        make_tx("f", 2, 2, inputs=("e:0",)),
+        make_tx("b", 2, 2, inputs=("a:0",)),
+        make_tx("e", 2, 2, inputs=("base:0",)),
+        make_tx("d", 2, 2, inputs=("b:0", "c:0")),
+        make_tx("c", 2, 2, inputs=("a:1",)),
+        make_tx("a", 2, 2, inputs=("coin-a:0",)),
+    ]
+    pkg = pp.add_package(package)
+    print(f"accepted {len(pkg)} txs (the inclusive 8-tx boundary)")
+    print(f"canonical order (parents first): {list(pkg.order)}")
+    print(f"package totals: fee={pkg.added_fee} weight={pkg.added_weight}")
+    print(f"pool size now: {len(pp)}; parents of g: {sorted(pp.parents('g'))}")
+    print("edges of g: spends d:0 and f:0, both present in the package")
+
+    # 9 txs must be rejected -- the boundary is inclusive at 8.
+    nine = [make_tx(f"n{i}", 1, 0, inputs=(f"cn{i}:0",)) for i in range(9)]
+    try:
+        pp.add_package(nine)
+    except ValidationError as err:
+        print(f"9-tx package rejected: kind={err.kind!r} ({err})")
+
+    print("-- real validation errors; pool must stay unchanged after each --")
+
+    def expect_package_error(label, txs, expect_kind=None):
+        before = sorted(pp.ids())
+        try:
+            pp.add_package(txs)
+        except (ValidationError, MissingDependencyError) as err:
+            kind = getattr(err, "kind", "missing_dependency")
+            if expect_kind is not None:
+                assert kind == expect_kind, (kind, expect_kind)
+            after = sorted(pp.ids())
+            print(f"  {label}: {type(err).__name__} kind={kind!r} "
+                  f"loc={getattr(err, 'loc', '?')}")
+            print(f"    pool unchanged: {before == after} ({len(before)} txs)")
+            return
+        raise AssertionError(f"{label}: expected an error")
+
+    # Cycle inside the package (x depends on y; y spends x:0).
+    expect_package_error(
+        "cycle",
+        [
+            make_tx("x", 1, 1, inputs=("cx:0",), depends=("y",)),
+            make_tx("y", 1, 1, inputs=("x:0",)),
+        ],
+        "cycle",
+    )
+    # Intra-package double spend of one outpoint.
+    expect_package_error(
+        "double spend",
+        [
+            make_tx("u", 1, 1, inputs=("q:0",)),
+            make_tx("v", 1, 1, inputs=("q:0",)),
+        ],
+        "double_spend",
+    )
+    # Spending an outpoint already spent in the pool is never a
+    # replacement via package submission (append-only).
+    expect_package_error(
+        "spends pool-owned outpoint",
+        [make_tx("rbf", 1, 100, inputs=("basecoin:0",))],
+        "conflict_with_pool",
+    )
+    # Explicit parent absent from both pool and package.
+    expect_package_error(
+        "missing parent",
+        [make_tx("m", 1, 1, inputs=("cm:0",), depends=("ghost",))],
+        "missing_dependency",
+    )
 
     elapsed = time.perf_counter() - t0
     print()
