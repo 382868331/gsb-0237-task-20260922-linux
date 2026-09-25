@@ -11,6 +11,13 @@ REASON_FEE_NOT_GREATER = "fee_not_strictly_greater"
 REASON_FEE_RATE_NOT_HIGHER = "fee_rate_not_strictly_higher"
 REASON_DEPENDS_ON_REMOVED = "depends_on_removed_set"
 
+# --- confirm-block failure reason codes (stable, public strings) ---
+CONFIRM_DUPLICATE_ID = "duplicate_id_in_block"
+CONFIRM_ALREADY_CONFIRMED = "txid_already_confirmed"
+CONFIRM_DOUBLE_SPEND = "block_double_spend"
+CONFIRM_SPENDS_CONFIRMED = "spends_already_confirmed_outpoint"
+CONFIRM_BAD_ORDER = "dependency_order_violation"
+
 
 class MempoolError(Exception):
     """Base class for all errors raised by this package."""
@@ -67,4 +74,21 @@ class ReplacementRejectedError(MempoolError):
         self.detail = detail
         super().__init__(
             f"replacement by {incoming_id!r} rejected ({reason}): {detail}"
+        )
+
+
+class ConfirmRejectedError(MempoolError):
+    """Raised when a ``confirm`` batch is invalid (pool left unchanged).
+
+    Attributes:
+        reason: one of the ``CONFIRM_*`` stable codes.
+        loc: dotted/indexed path to the offending entry, or ``"?"``.
+    """
+
+    def __init__(self, reason, detail, loc="?"):
+        self.reason = reason
+        self.loc = loc
+        full = f"[{loc}] " if loc not in (None, "?") else ""
+        super().__init__(
+            f"{full}block confirmation rejected ({reason}): {detail}"
         )

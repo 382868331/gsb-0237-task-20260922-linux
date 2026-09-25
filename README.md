@@ -22,7 +22,8 @@ ancestor_pool/          importable library
   errors.py             error hierarchy + stable reason codes
   model.py              Tx / make_tx + field validation
   graph.py              DAG edges, closures, cycles, topological order
-  pool.py               AncestorPool: atomic add / replacement / batch
+  pool.py               AncestorPool: atomic add / replacement / batch,
+                        ledger-confirmed block handling (confirm)
   select.py             select_package: budgeted branch-and-bound
 tests/
   _reference.py         independent <=16-tx exhaustive reference
@@ -85,6 +86,14 @@ All derive from `MempoolError`:
   - `fee_rate_not_strictly_higher`
   - `depends_on_removed_set`
   - `replacement_disallowed` (when `allow_replacement=False`)
+- `ConfirmRejectedError(reason, loc, detail)` for an invalid
+  `confirm` batch (the pool is left byte-for-byte unchanged), with
+  stable `reason` codes:
+  - `duplicate_id_in_block`
+  - `txid_already_confirmed`
+  - `block_double_spend`
+  - `spends_already_confirmed_outpoint`
+  - `dependency_order_violation`
 
 ## Replacement semantics — `AncestorPool.add(tx)`
 
@@ -112,6 +121,59 @@ Read-only helpers: `len`, `in`, `ids()`, `get()`, `parents()`,
 `children()`, `ancestors()`, `descendants()`, `spender_of(outpoint)`.
 Capacity is 30 txs; a conflicting add at capacity is a replacement
 (removes ≥ 1), not growth.
+
+## Block confirmation — `AncestorPool.confirm(block_transactions)`
+
+`confirm` takes the transactions of one block already confirmed by the
+outer ledger, **in block (parent-first) order**, and applies them
+atomically. It returns a `ConfirmResult`:
+
+- `confirmed_ids` — block txids in the given order;
+- `evicted_ids` — pool txs removed because a block tx spends one of
+  their inputs, **together with all their descendants** (same rule as a
+  conflicting `add`);
+- `retained_ids` — pool txs surviving the confirmation;
+- `reparented_ids` — surviving txs whose in-pool parent moved to the
+  ledger (they stay, spending the now-confirmed output);
+- `created_outpoints` — the independently maintained confirmed
+  outpoint set: referenced `creator:vout` outpoints whose creator is
+  confirmed.
+
+Same-id semantics: a pool tx with the same id as a block tx is simply
+*that transaction being confirmed*. It leaves the pool, but its
+descendants are **kept** and become spenders of confirmed outputs; they
+are not treated as ordinary replacement removals. Confirmed txs take
+priority and are never reported in both `confirmed_ids` and
+`evicted_ids`.
+
+The entire batch is validated before any mutation and is rejected
+wholesale (pool unchanged) on any of:
+
+1. a duplicate txid inside the list, or a txid confirmed earlier;
+2. two block txs spending the same outpoint, or a block tx spending an
+   outpoint already spent by a confirmed block;
+3. a dependency-order violation — a block tx explicitly depends on, or
+   spends a `creator:vout` outpoint of, a block tx that does not appear
+   strictly earlier in the list (this also rejects cycles).
+
+After confirmation:
+
+- confirmed state is tracked independently (`confirmed_ids()`,
+  `confirmed_outpoints()`, `is_outpoint_spent_confirmed(op)`,
+  `confirmed_parents(txid)`);
+- a later pool `add`/`add_many` tx spending an outpoint already spent
+  by a confirmed tx is rejected (`ValidationError`,
+  `kind="confirmed_double_spend"`); the pool never silently keeps a
+  double spender;
+- `select_package` still requires pool-internal dependency closure, but
+  a confirmed parent is **no longer in the pool**: it contributes no
+  block weight and no fee, and its surviving child is selectable on its
+  own.
+
+This is deliberately **not** a full ledger: there is no UTXO set of
+every created output, no reorg handling, and no rewriting of confirmed
+history; only outpoints actually referenced by pool/block transactions
+are tracked.
 
 ## Package selection — `select_package(pool, block_weight, *, node_budget)`
 
@@ -187,6 +249,9 @@ human-readable rates.
 - No signatures, scripts, consensus rules, timelocks, mempool policy
   knobs (signaling, BIP125 rules, package limits beyond count), or
   persistence; in-memory single-process only.
+- `confirm` models one-way block confirmation only: no reorg/unconfirm,
+  no full UTXO ledger, and confirmed outpoints are tracked only when
+  referenced by pool or block transactions.
 - Tie-break is exactly one documented convention (ascending-id tuple,
   prefix-smallest); other lexicographic conventions are not offered.
 
@@ -197,4 +262,8 @@ successful conflict replacement that evicts a low-fee parent and its
 high-fee child, the proven fee-optimal package with three different
 per-exclusion reasons, an actually raised
 `ReplacementRejectedError(fee_rate_not_strictly_higher)` boundary with
-the pool verified unchanged, and a real `budget_exhausted` result.
+the pool verified unchanged, a real `budget_exhausted` result, and
+block-confirmation cases (parent confirmed with child retained and
+re-parented to the confirmed output; an out-of-block conflict evicting
+the loser and its descendants; an illegal block rejected with full
+rollback).

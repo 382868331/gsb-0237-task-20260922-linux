@@ -2,7 +2,7 @@
 
 Public surface:
     Tx, make_tx
-    AncestorPool, AddResult
+    AncestorPool, AddResult, ConfirmResult
     select_package, SelectionResult, Exclusion
     MempoolError, ValidationError, DuplicateTxIdError,
     MissingDependencyError, ReplacementRejectedError
@@ -17,9 +17,15 @@ from .errors import (
     DuplicateTxIdError,
     MissingDependencyError,
     ReplacementRejectedError,
+    ConfirmRejectedError,
     REASON_FEE_NOT_GREATER,
     REASON_FEE_RATE_NOT_HIGHER,
     REASON_DEPENDS_ON_REMOVED,
+    CONFIRM_DUPLICATE_ID,
+    CONFIRM_ALREADY_CONFIRMED,
+    CONFIRM_DOUBLE_SPEND,
+    CONFIRM_SPENDS_CONFIRMED,
+    CONFIRM_BAD_ORDER,
 )
 from .model import Tx, make_tx, validate_tx
 from .graph import validate_batch
@@ -45,6 +51,7 @@ __all__ = [
     "validate_batch",
     "AncestorPool",
     "AddResult",
+    "ConfirmResult",
     "select_package",
     "SelectionResult",
     "Exclusion",
@@ -53,9 +60,15 @@ __all__ = [
     "DuplicateTxIdError",
     "MissingDependencyError",
     "ReplacementRejectedError",
+    "ConfirmRejectedError",
     "REASON_FEE_NOT_GREATER",
     "REASON_FEE_RATE_NOT_HIGHER",
     "REASON_DEPENDS_ON_REMOVED",
+    "CONFIRM_DUPLICATE_ID",
+    "CONFIRM_ALREADY_CONFIRMED",
+    "CONFIRM_DOUBLE_SPEND",
+    "CONFIRM_SPENDS_CONFIRMED",
+    "CONFIRM_BAD_ORDER",
     "STATUS_PROVEN_OPTIMAL",
     "STATUS_BUDGET_EXHAUSTED",
     "CODE_OVERWEIGHT",

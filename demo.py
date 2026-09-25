@@ -12,6 +12,10 @@ prints:
    rate is not strictly higher is refused atomically;
 3. the search-budget boundary -- a tiny node budget returns
    ``budget_exhausted`` instead of an optimality claim.
+4. block confirmation -- a confirmed parent leaves the pool while its
+   child stays, re-pointed at the confirmed outpoint; an out-of-block
+   conflict evicts a conflicting tx and its descendants; an illegal
+   block rolls back wholesale.
 """
 
 import time
@@ -87,6 +91,56 @@ def main():
     print(f"best package found: {list(bounded.selected)} "
           f"fee={bounded.total_fee} -- returned without optimality claim")
     assert bounded.status == STATUS_BUDGET_EXHAUSTED
+
+    hr("[5] Block confirmation: parent confirmed, child retained")
+    # Fresh DAG: coin:0 -> CP -> CC -> CG, plus independent CK.
+    cpool = AncestorPool()
+    cpool.add(make_tx("CP", weight=40, fee=3, inputs=("ccoin:0",)))
+    cpool.add(make_tx("CC", weight=10, fee=40, inputs=("CP:0",)))
+    cpool.add(make_tx("CG", weight=8, fee=5, inputs=("CC:0",)))
+    cpool.add(make_tx("CK", weight=12, fee=7, inputs=("ckoin:0",)))
+    print("pool before:", sorted(cpool.ids()))
+    # One block confirms CP (same id) and a rival RX spending CP:0.
+    # The pool spender of CP:0 is CC (different id), so CC and its
+    # descendant CG are evicted as conflict losers; CP leaves as
+    # confirmed; CK is untouched.
+    res = cpool.confirm([
+        make_tx("CP", weight=40, fee=3, inputs=("ccoin:0",)),
+        make_tx("RX", weight=10, fee=60, inputs=("CP:0",)),
+    ])
+    print("confirmed   :", list(res.confirmed_ids))
+    print("evicted     :", sorted(res.evicted_ids))
+    print("pool after  :", sorted(cpool.ids()))
+    print("confirmed outpoints:", sorted(cpool.confirmed_outpoints()))
+
+    # Parent-confirmed / child-retained case in isolation.
+    ppool = AncestorPool()
+    ppool.add(make_tx("PP", weight=30, fee=4, inputs=("pcoin:0",)))
+    ppool.add(make_tx("PC", weight=6, fee=50, inputs=("PP:0",)))
+    cres = ppool.confirm([make_tx("PP", 30, 4, inputs=("pcoin:0",))])
+    print(f"child retained: pool={sorted(ppool.ids())}, "
+          f"reparented={sorted(cres.reparented_ids)}, "
+          f"confirmed parents of PC={sorted(ppool.confirmed_parents('PC'))}")
+    csel = select_package(ppool, 100, node_budget=10_000)
+    print(f"select after confirm: {list(csel.selected)} "
+          f"fee={csel.total_fee} weight={csel.total_weight} "
+          "(confirmed PP contributes no weight/fee)")
+
+    hr("[6] Illegal confirmation rolls the whole batch back")
+    bad_pool = AncestorPool()
+    bad_pool.add(make_tx("CP", weight=40, fee=3, inputs=("ccoin:0",)))
+    bad_pool.add(make_tx("CC", weight=10, fee=40, inputs=("CP:0",)))
+    try:
+        # Child listed before its parent: dependency-order violation.
+        bad_pool.confirm([
+            make_tx("CC", weight=10, fee=40, inputs=("CP:0",)),
+            make_tx("CP", weight=40, fee=3, inputs=("ccoin:0",)),
+        ])
+    except Exception as err:  # ConfirmRejectedError
+        print(f"{type(err).__name__}: {err.reason}")
+        print(f"  loc   : {err.loc}")
+        print(f"  detail: {err}")
+    print("pool unchanged after rollback:", sorted(bad_pool.ids()))
 
     elapsed = time.perf_counter() - t0
     print()
