@@ -113,6 +113,47 @@ Read-only helpers: `len`, `in`, `ids()`, `get()`, `parents()`,
 Capacity is 30 txs; a conflicting add at capacity is a replacement
 (removes ≥ 1), not growth.
 
+## Confirmation — `AncestorPool.confirm(block)`
+
+Applies a block of transactions already confirmed by the outer ledger.
+Each block entry is a `BlockTx(tx, created)` (or a plain
+`(tx, created)` pair): the confirmed transaction plus the explicit
+list of outpoints it creates (`Tx` does not declare outputs).
+
+- **Validation first, then one atomic commit.** The whole block is
+  checked before any mutation: no duplicate ids (within the block or
+  against already-confirmed ids), no duplicate created outpoints, no
+  intra-block double spends, no spends of previously confirmed-spent
+  outpoints, and dependency order — every explicit `depends` entry and
+  every spent `"creator:vout"` outpoint must resolve to an earlier
+  block transaction or an already-confirmed transaction (a dependency
+  on an unconfirmed pool transaction is rejected). Any violation raises
+  a locatable error and leaves the pool byte-for-byte unchanged.
+- **Same-id pool transactions are removed by confirmation**, but their
+  pool descendants are *kept*: the edge to the confirmed parent simply
+  disappears and the descendant now depends on a confirmed output.
+- **Conflicting pool transactions** (double-spending any block input)
+  are removed **together with all their descendants**. An id confirmed
+  in the same block is always reported as confirmed, never as
+  conflict-removed (confirmation wins, reported once).
+- `ConfirmResult` reports `confirmed_ids` (block order),
+  `pool_confirmed_ids` (removed from the pool by confirmation) and
+  `conflict_removed_ids` (evicted with descendants); `removed_ids`
+  is their union.
+- The pool maintains a minimal confirmed view — not a full ledger:
+  `is_confirmed(txid)`, `confirmed_outpoints()` (created and still
+  unspent) and `confirmed_spent()` (consumed by confirmed txs).
+  Afterwards, `add` accepts spends of confirmed-created outpoints
+  (external coins), rejects re-adding a confirmed id
+  (`DuplicateTxIdError`) and rejects spending a confirmed-spent
+  outpoint (`ValidationError`, kind `double_spend`). No reorg
+  handling: confirmed state is append-only.
+- **Selection after confirmation**: `select_package` still requires
+  closure over *pool-internal* dependencies only. Confirmed
+  transactions are no longer in the pool, so they occupy no block
+  weight and contribute no fee; kept descendants are selectable on
+  their own.
+
 ## Package selection — `select_package(pool, block_weight, *, node_budget)`
 
 Finds the dependency-closed (ancestor-closed) subset maximising total
@@ -187,6 +228,8 @@ human-readable rates.
 - No signatures, scripts, consensus rules, timelocks, mempool policy
   knobs (signaling, BIP125 rules, package limits beyond count), or
   persistence; in-memory single-process only.
+- Confirmation is one-way: no reorg/disconnection handling, and the
+  confirmed-outpoint view is a pair of sets, not a full UTXO ledger.
 - Tie-break is exactly one documented convention (ascending-id tuple,
   prefix-smallest); other lexicographic conventions are not offered.
 
@@ -197,4 +240,6 @@ successful conflict replacement that evicts a low-fee parent and its
 high-fee child, the proven fee-optimal package with three different
 per-exclusion reasons, an actually raised
 `ReplacementRejectedError(fee_rate_not_strictly_higher)` boundary with
-the pool verified unchanged, and a real `budget_exhausted` result.
+the pool verified unchanged, a real `budget_exhausted` result, and a
+block confirmation that keeps a confirmed parent's descendants in the
+pool while evicting a conflicting transaction's whole subtree.

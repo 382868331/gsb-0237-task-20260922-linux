@@ -3,6 +3,7 @@
 Public surface:
     Tx, make_tx
     AncestorPool, AddResult
+    BlockTx, ConfirmResult
     select_package, SelectionResult, Exclusion
     MempoolError, ValidationError, DuplicateTxIdError,
     MissingDependencyError, ReplacementRejectedError
@@ -23,7 +24,7 @@ from .errors import (
 )
 from .model import Tx, make_tx, validate_tx
 from .graph import validate_batch
-from .pool import AncestorPool, AddResult
+from .pool import AncestorPool, AddResult, BlockTx, ConfirmResult
 from .select import (
     select_package,
     SelectionResult,
@@ -45,6 +46,8 @@ __all__ = [
     "validate_batch",
     "AncestorPool",
     "AddResult",
+    "BlockTx",
+    "ConfirmResult",
     "select_package",
     "SelectionResult",
     "Exclusion",

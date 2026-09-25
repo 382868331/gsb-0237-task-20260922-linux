@@ -12,12 +12,16 @@ prints:
    rate is not strictly higher is refused atomically;
 3. the search-budget boundary -- a tiny node budget returns
    ``budget_exhausted`` instead of an optimality claim.
+4. a block confirmation -- a confirmed parent leaves the pool while
+   its child stays (now depending on a confirmed output), and a
+   conflicting pool subtree is evicted.
 """
 
 import time
 
 from ancestor_pool import (
     AncestorPool,
+    BlockTx,
     make_tx,
     select_package,
     ReplacementRejectedError,
@@ -87,6 +91,41 @@ def main():
     print(f"best package found: {list(bounded.selected)} "
           f"fee={bounded.total_fee} -- returned without optimality claim")
     assert bounded.status == STATUS_BUDGET_EXHAUSTED
+
+    hr("[5] Block confirmation: descendants of confirmed txs survive")
+    # Fresh pool: A -> B chain (A will be confirmed) plus an unrelated
+    # C -> D subtree (C will be double-spent by a block transaction).
+    pool2 = AncestorPool()
+    a = make_tx("A", weight=10, fee=40, inputs=("coinA:0",))
+    b = make_tx("B", weight=10, fee=30, inputs=("A:0",), depends=("A",))
+    c = make_tx("C", weight=10, fee=5, inputs=("coinC:0",))
+    d = make_tx("D", weight=10, fee=9, inputs=("C:0",), depends=("C",))
+    pool2.add_many([a, b, c, d])
+    print(f"pool before block: {sorted(pool2.ids())}")
+
+    # The ledger confirms A (creating A:0) and a rival W that
+    # double-spends C's input: A leaves the pool but B stays (now
+    # depending on the confirmed output A:0); C and its descendant D
+    # are evicted together.
+    w = make_tx("W", weight=10, fee=5, inputs=("coinC:0",))
+    block = [BlockTx(a, created=("A:0",)), BlockTx(w, created=("W:0",))]
+    result = pool2.confirm(block)
+    print(f"confirmed          : {list(result.confirmed_ids)}")
+    print(f"removed by confirm : {sorted(result.pool_confirmed_ids)}")
+    print(f"removed by conflict: {sorted(result.conflict_removed_ids)}")
+    print(f"pool after block   : {sorted(pool2.ids())}  "
+          f"(B kept, now depends on confirmed output A:0)")
+    print(f"confirmed outpoints: {sorted(pool2.confirmed_outpoints())}")
+    sel = select_package(pool2, 10)
+    print(f"select(weight=10)  : {list(sel.selected)} "
+          f"fee={sel.total_fee} -- confirmed A contributes nothing")
+
+    # coinA:0 is now confirmed-spent, so add() rejects re-spending it.
+    try:
+        pool2.add(make_tx("R3", weight=5, fee=100, inputs=("coinA:0",)))
+    except Exception as err:
+        print(f"add spending confirmed-spent coin rejected: "
+              f"{type(err).__name__}: {err}")
 
     elapsed = time.perf_counter() - t0
     print()
