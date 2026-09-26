@@ -10,6 +10,9 @@ transaction DAG.
   cloud API, or Docker
 - Interface bound: at most **30 transactions** in a pool; the
   independent exhaustive reference supports **≤ 16 transactions**
+- `select_optimal` (this increment): at most **24 candidates** per
+  call; its independent exhaustive reference supports **≤ 16
+  candidates**
 
 This implements only the finite mathematical/protocol subset defined by
 this task. It is **not** a full node mempool and makes no claim of
@@ -24,19 +27,27 @@ ancestor_pool/          importable library
   graph.py              DAG edges, closures, cycles, topological order
   pool.py               AncestorPool: atomic add / replacement / batch
   select.py             select_package: budgeted branch-and-bound
+  optimal.py            select_optimal: exact conflict-aware selector
 tests/
   _reference.py         independent <=16-tx exhaustive reference
                         (does NOT import or call the core solver)
+  _reference_optimal.py independent <=16-candidate exhaustive
+                        reference for select_optimal (with conflicts)
   _data.py              deterministic seeded synthetic DAG generator
   test_*.py             unit + cross-check tests
 demo.py                 fixed-input live demonstration
+demo_iteration.py       live demo of select_optimal vs select_package
 ```
 
 ## Running
 
 ```bash
+python -m venv .venv            # one-time environment preparation
+source .venv/bin/activate       # any Python 3.14.7 interpreter works;
+                                # no packages need to be installed
 python -m unittest discover -s tests -v   # tests
-python demo.py                             # demonstration (< 1 s here)
+python demo_iteration.py                  # select_optimal demo (< 90 s)
+python demo.py                            # original demo (< 1 s here)
 ```
 
 No `pip install` step is required beyond a Python 3.14.7 interpreter.
@@ -151,6 +162,47 @@ fee subject to `Σ weight ≤ block_weight`.
   - `budget_inconclusive` — only under `budget_exhausted`: its status
     could not be settled within budget (never used when proven).
 
+## Optimal selection — `select_optimal(source, block_weight, *, node_budget)`
+
+This increment adds a second, exact selector next to the retained fast
+`select_package`. It maximises total fee under the weight cap over an
+explicit candidate set with two extra rules:
+
+- **Ancestors**: a selected transaction must include every
+  not-yet-confirmed ancestor present in the candidate set (ancestor
+  closure, as before).
+- **Conflicts**: two candidates spending the identical outpoint string
+  are mutually exclusive and can never be selected together. Plain
+  candidate iterables may therefore contain double spenders (a pool
+  never does); structural validation still rejects duplicate ids,
+  unresolvable `depends`, and cycles with locatable errors.
+
+Contract details:
+
+- `source` is an `AncestorPool` (used strictly **read-only** — nothing
+  is marked confirmed and the pool is byte-for-byte unchanged) or a
+  plain iterable of `Tx`; **at most 24 candidates** (`MAX_CANDIDATES`),
+  enforced with a `ValidationError` of kind `capacity`.
+- The solver is exact branch-and-bound over the candidate DAG — **not**
+  fee-rate greedy with ancestor backfill. The bound is the same
+  integer-floored fractional-knapsack relaxation (closure and
+  conflicts ignored, hence admissible).
+- **Tie-break**: among maximum-fee packages, the **smaller total
+  weight** wins first; remaining ties go to the lexicographically
+  smallest canonical id set (`tuple(sorted(ids))`). This differs from
+  `select_package`'s documented id-tuple-only tie-break, so the two
+  modes can legitimately return different packages on the same pool
+  (shown in `demo_iteration.py`).
+- `OptimalResult` reports the selected ids in topological order, the
+  fee/weight ledger (`total_fee`, `total_weight`), `nodes_used`, and a
+  `status`:
+  - `optimal` — search completed; the package is the global optimum
+    and `fee_upper_bound == total_fee`;
+  - `budget_exhausted` — the node budget ran out; the best feasible
+    package found is returned together with `fee_upper_bound`, an
+    admissible upper bound on the optimum fee. It is never reported
+    as `optimal`.
+
 ## Numeric accuracy / error policy
 
 There are **no floating-point results** in the core: fees, weights,
@@ -180,6 +232,18 @@ human-readable rates.
 
 - Fixed 30-tx pool cap; beyond the bound the solver offers no
   optimality guarantee except what the node budget permits.
+- `select_optimal` is separately capped at 24 candidates. The problem
+  remains NP-hard; a tiny `node_budget` honestly yields
+  `budget_exhausted` with the best feasible package and an admissible
+  `fee_upper_bound` — optimality is never claimed when the bound is not
+  closed. `fee_upper_bound` is the loose global fractional-knapsack
+  bound, not a tight interval.
+- `select_optimal` candidate iterables may contain double spenders
+  (that is the point of the conflict rule), so they intentionally do
+  not go through pool-batch validation; only structural checks apply.
+- The old `select_package` is retained unchanged for compatibility;
+  it does not model conflicts (a pool cannot contain them) and keeps
+  its id-tuple-only tie-break.
 - A tiny `node_budget` can return `budget_exhausted` immediately; the
   returned package is always feasible but may be suboptimal and its
   tie-break unsettled (reported honestly via status and exclusion
@@ -198,3 +262,10 @@ high-fee child, the proven fee-optimal package with three different
 per-exclusion reasons, an actually raised
 `ReplacementRejectedError(fee_rate_not_strictly_higher)` boundary with
 the pool verified unchanged, and a real `budget_exhausted` result.
+
+`python demo_iteration.py` computes live in well under the 90-second
+limit: the old and new selectors returning different tie-break packages
+on the same pool; the low-fee-ancestor/high-fee-child case; a shared
+ancestor paid only once; mutually exclusive double spends; a real
+budget-exhaustion result with its admissible fee upper bound; and a
+check that the pool is unchanged after selection.

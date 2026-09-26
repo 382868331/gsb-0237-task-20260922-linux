@@ -37,6 +37,13 @@ from .select import (
     DEFAULT_BUDGET,
     MAX_TRANSACTIONS,
 )
+from .optimal import (
+    select_optimal,
+    OptimalResult,
+    STATUS_OPTIMAL,
+    MAX_CANDIDATES,
+    DEFAULT_NODE_BUDGET,
+)
 
 __all__ = [
     "Tx",
@@ -64,4 +71,9 @@ __all__ = [
     "CODE_BUDGET_INCONCLUSIVE",
     "DEFAULT_BUDGET",
     "MAX_TRANSACTIONS",
+    "select_optimal",
+    "OptimalResult",
+    "STATUS_OPTIMAL",
+    "MAX_CANDIDATES",
+    "DEFAULT_NODE_BUDGET",
 ]
