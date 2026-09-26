@@ -4,6 +4,7 @@ Public surface:
     Tx, make_tx
     AncestorPool, AddResult
     select_package, SelectionResult, Exclusion
+    select_optimal, OptimalSelectionResult, LedgerEntry
     MempoolError, ValidationError, DuplicateTxIdError,
     MissingDependencyError, ReplacementRejectedError
 
@@ -24,6 +25,13 @@ from .errors import (
 from .model import Tx, make_tx, validate_tx
 from .graph import validate_batch
 from .pool import AncestorPool, AddResult
+from .optimal import (
+    select_optimal,
+    OptimalSelectionResult,
+    LedgerEntry,
+    STATUS_OPTIMAL,
+    MAX_CANDIDATES,
+)
 from .select import (
     select_package,
     SelectionResult,
@@ -46,6 +54,11 @@ __all__ = [
     "AncestorPool",
     "AddResult",
     "select_package",
+    "select_optimal",
+    "OptimalSelectionResult",
+    "LedgerEntry",
+    "STATUS_OPTIMAL",
+    "MAX_CANDIDATES",
     "SelectionResult",
     "Exclusion",
     "MempoolError",

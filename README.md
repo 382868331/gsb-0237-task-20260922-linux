@@ -10,6 +10,8 @@ transaction DAG.
   cloud API, or Docker
 - Interface bound: at most **30 transactions** in a pool; the
   independent exhaustive reference supports **≤ 16 transactions**
+- `select_optimal` (exact, conflict-aware) accepts at most
+  **24 candidate transactions**
 
 This implements only the finite mathematical/protocol subset defined by
 this task. It is **not** a full node mempool and makes no claim of
@@ -24,6 +26,8 @@ ancestor_pool/          importable library
   graph.py              DAG edges, closures, cycles, topological order
   pool.py               AncestorPool: atomic add / replacement / batch
   select.py             select_package: budgeted branch-and-bound
+  optimal.py            select_optimal: exact conflict-aware selector
+                        for <=24 candidates
 tests/
   _reference.py         independent <=16-tx exhaustive reference
                         (does NOT import or call the core solver)
@@ -35,12 +39,15 @@ demo.py                 fixed-input live demonstration
 ## Running
 
 ```bash
-python -m unittest discover -s tests -v   # tests
-python demo.py                             # demonstration (< 1 s here)
+python3.14 -m venv .venv && . .venv/bin/activate   # one-time venv prep
+python -m unittest discover -s tests -v            # tests
+python demo.py                                     # baseline demo (< 1 s)
+python demo_iteration.py                           # select_optimal demo
 ```
 
 No `pip install` step is required beyond a Python 3.14.7 interpreter.
-`requirements.txt` is intentionally empty of dependencies.
+`requirements.txt` is intentionally empty of dependencies; the venv is
+only a convenience for interpreter isolation.
 
 ## Public data structures
 
@@ -151,6 +158,42 @@ fee subject to `Σ weight ≤ block_weight`.
   - `budget_inconclusive` — only under `budget_exhausted`: its status
     could not be settled within budget (never used when proven).
 
+## Exact small-pool selection — `select_optimal(candidates, block_weight, *, node_budget)`
+
+Finds the conflict-free, ancestor-closed subset maximising total fee
+subject to `Σ weight ≤ block_weight`. This is the exact counterpart of
+`select_package` (which is kept unchanged as the legacy fast
+interface); it is **not** a fee-rate greedy pass with ancestors patched
+in afterwards.
+
+- **Candidates**: an `AncestorPool` (read-only — selection never
+  mutates the pool and never marks transactions confirmed) or a plain
+  iterable of `Tx`. At most **24** candidates
+  (`optimal.MAX_CANDIDATES`); more raises
+  `ValidationError(kind="capacity")`. A plain iterable *may* contain
+  double-spending transactions — they are conflicts the selector must
+  respect, not structural errors. A pool never contains conflicts.
+- **Constraints**: the chosen set is ancestor-closed (every
+  not-yet-confirmed ancestor comes along) and conflict-free (two
+  transactions spending the same outpoint can never coexist).
+- **Tie-break** (differs from `select_package` by design): higher fee,
+  then **smaller total weight**, then the lexicographically smallest
+  ascending-id tuple (`tuple(sorted(ids))`, proper prefix smaller).
+- **Result** (`OptimalSelectionResult`): `selected` in the
+  lexicographically smallest topological order of the chosen subset; a
+  per-transaction fee/weight `ledger` (`LedgerEntry` with cumulative
+  totals); `total_fee` / `total_weight`; `status`; `nodes_used` /
+  `node_budget`; and `fee_upper_bound`.
+- **Status**: `"optimal"` only when the search completes. On
+  `"budget_exhausted"` the best feasible package found is returned
+  together with `fee_upper_bound`, an admissible integer upper bound on
+  the optimum fee (exact and equal to `total_fee` once proven); the
+  status is never reported as `"optimal"` in that case.
+- Search: depth-first branch-and-bound with the same integer-only
+  fractional-knapsack relaxation as `select_package`, extended with
+  conflict propagation; pruning is strict so equal-fee lighter or
+  lexicographically smaller packages are never cut.
+
 ## Numeric accuracy / error policy
 
 There are **no floating-point results** in the core: fees, weights,
@@ -180,6 +223,12 @@ human-readable rates.
 
 - Fixed 30-tx pool cap; beyond the bound the solver offers no
   optimality guarantee except what the node budget permits.
+- `select_optimal` is capped at 24 candidates and is exponential in
+  the worst case (the problem is NP-hard); the node budget is the hard
+  work bound, and `budget_exhausted` results carry only the reported
+  `fee_upper_bound`, not an optimality claim. The two selectors use
+  different documented tie-breaks, so equal-fee packages can differ
+  between them (shown live by `demo_iteration.py`).
 - A tiny `node_budget` can return `budget_exhausted` immediately; the
   returned package is always feasible but may be suboptimal and its
   tie-break unsettled (reported honestly via status and exclusion
@@ -191,6 +240,13 @@ human-readable rates.
   prefix-smallest); other lexicographic conventions are not offered.
 
 ## Demo
+
+`python demo_iteration.py` computes live (no sleeps, no pre-recorded
+data, finishes in well under 90 s): both selection modes on the *same*
+pool producing different tie-broken packages, ancestor closure with a
+shared root paid once, a mutually exclusive double-spend pair resolved
+in a candidate list, and a real `budget_exhausted` result whose
+`fee_upper_bound` is checked against the proven optimum.
 
 `python demo.py` computes live (no sleeps, no pre-recorded data): a
 successful conflict replacement that evicts a low-fee parent and its
